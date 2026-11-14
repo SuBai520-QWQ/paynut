@@ -119,14 +119,35 @@ export class CashuGate {
     this.redeemer =
       opts.redeemer ??
       (async (mintUrl, token) => {
-        const wallet = await walletFor(mintUrl, this.unit);
-        // cashu-ts compares the token's mint string with the wallet's, so a
-        // token that spells the same mint differently (case, default port)
-        // would be rejected after passing the canonical trust check. Decode
-        // with the wallet's keysets and redeem against the canonical URL.
-        const decoded = wallet.decodeToken(token);
-        decoded.mint = mintUrl;
-        return wallet.receive(decoded);
+        const attempt = async (): Promise<Proof[]> => {
+          const wallet = await walletFor(mintUrl, this.unit);
+          // cashu-ts compares the token's mint string with the wallet's, so a
+          // token that spells the same mint differently (case, default port)
+          // would be rejected after passing the canonical trust check. Decode
+          // with the wallet's keysets and redeem against the canonical URL.
+          const decoded = wallet.decodeToken(token);
+          decoded.mint = mintUrl;
+          return wallet.receive(decoded);
+        };
+        try {
+          return await attempt();
+        } catch (err) {
+          // A mint that rotates its keysets leaves the cached wallet holding
+          // a stale keyset table, and every redemption then fails with a
+          // keyset error until the process restarts (round-1 known limit).
+          // Reload the mint info once and retry; if it still fails, evict
+          // the cached wallet so the next payment loads it fresh.
+          const message = err instanceof Error ? err.message : String(err);
+          if (!/keyset/i.test(message)) throw err;
+          const wallet = await walletFor(mintUrl, this.unit);
+          await wallet.loadMint().catch(() => undefined);
+          try {
+            return await attempt();
+          } catch {
+            walletPromises.delete(`${mintUrl}|${this.unit}`);
+            throw err;
+          }
+        }
       });
     this.splitter =
       opts.splitter ??
@@ -203,6 +224,14 @@ export class CashuGate {
       // are already burned, so the received value must go back to the payer
       // instead of being silently kept by the gate.
       const refund = receivedTotal > 0 ? this.encodeChange(mint, receivedProofs) : undefined;
+      if (receivedTotal > 0 && !refund) {
+        // Encoding the refund failed (PN-N3): the value cannot ride back in
+        // a header, so leave the proofs in the log for manual recovery
+        // instead of letting them evaporate without a trace.
+        console.error(
+          `paynut: could not encode the insufficient_after_fees refund for ${mint}; received proofs kept for manual recovery: ${JSON.stringify(receivedProofs)}`,
+        );
+      }
       return {
         ok: false,
         reason: 'insufficient_after_fees',
@@ -228,8 +257,22 @@ export class CashuGate {
         );
       }
       if (split) {
-        keptProofs = split.keep;
-        changeToken = this.encodeChange(mint, split.send);
+        const encoded = this.encodeChange(mint, split.send);
+        if (encoded) {
+          keptProofs = split.keep;
+          changeToken = encoded;
+        } else {
+          // Encoding the change failed (PN-N3): the split's send proofs
+          // exist only in this variable, so handing them back is impossible
+          // and dropping them would burn the payer's change. Keep the full
+          // received amount in the gate's own balance instead — the same
+          // least-bad outcome as the split-failure path above, and
+          // paid.amount reports it honestly.
+          console.error(
+            `paynut: change encoding failed for ${mint}; keeping the full ${receivedTotal} ${this.unit} received`,
+          );
+          keptProofs = receivedProofs;
+        }
       }
     }
 
@@ -247,6 +290,17 @@ export class CashuGate {
       console.error('paynut: onPayment threw after the payment was settled', err);
     }
     return { ok: true, paid, changeToken };
+  }
+
+  /**
+   * Encode a settled payment's kept proofs as a token that hands the full
+   * kept value back to the payer. Adapters use this to compensate the payer
+   * when the paid handler fails after the payment already settled (PN-N2):
+   * the proofs are bearer instruments, so encoding them IS the refund.
+   * Returns undefined when the proofs cannot be encoded.
+   */
+  refundTokenFor(info: PaymentInfo): string | undefined {
+    return this.encodeChange(info.mint, info.proofs);
   }
 
   /** Encode proofs as a token, or undefined if they cannot be encoded. */

@@ -71,6 +71,7 @@ npm run build     # typecheck + emit dist/
 ## Notes & limits
 
 - **Fees are real.** Mints charge an input fee per proof on every swap. The gate nets `received − fee`; a token that doesn't cover price + fee is rejected (`insufficient_after_fees`), and the value the gate did receive comes back in `X-Cashu-Change` as a refund — clients should use `includeFees` or slightly overpay (change comes back anyway).
+- **Handler failures are refunded.** The payment settles before your handler runs. If the handler answers 5xx through the normal response methods (`res.json` / `res.send` / `res.sendStatus`), the paywall attaches an `X-Cashu-Refund` token worth the full kept amount, and the demo client banks it automatically — the payer is made whole. One exception: errors that escape to Express's *default* error handler can't carry the header (it writes the response head itself); install your own error handler that responds via `res.status(...).json(...)` if you need refunds on thrown errors too.
 - **Trust list = your mints list.** The gate only accepts tokens from mints you configure. A token from any other mint is rejected before redemption.
 - **Earnings are proofs.** What the gate keeps are ordinary Cashu proofs at your mint: melt them to Lightning or hold them like any wallet would. The demo keeps them in memory and reports totals on `/`; a production deployment should persist `onPayment` proofs.
 - Built with [`@cashu/cashu-ts`](https://github.com/cashubtc/cashu-ts) v3. MIT licensed.
