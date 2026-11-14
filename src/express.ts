@@ -6,7 +6,9 @@
  *
  * Unpaid requests get HTTP 402 with a JSON quote. Paid requests carry the
  * Cashu token in the `X-Cashu` header; overpayment change comes back in the
- * `X-Cashu-Change` response header.
+ * `X-Cashu-Change` response header. A 402 can also carry `X-Cashu-Change`
+ * when a token was redeemed but fees left it short of the price: the header
+ * then holds a refund of the value the gate received.
  */
 import type { NextFunction, Request, Response } from 'express';
 import { CashuGate, type GateOptions, type PaymentInfo } from './gate.js';
@@ -34,6 +36,8 @@ export function paywall(opts: GateOptions) {
     }
     const result = await gate.verifyPayment(token);
     if (!result.ok) {
+      // insufficient_after_fees refunds the redeemed value in a change token.
+      if (result.changeToken) res.setHeader('X-Cashu-Change', result.changeToken);
       const status = result.reason === 'malformed_token' ? 400 : 402;
       res.status(status).json({
         error: result.reason,

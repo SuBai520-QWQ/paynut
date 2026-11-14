@@ -70,7 +70,7 @@ npm run build     # typecheck + emit dist/
 
 ## Notes & limits
 
-- **Fees are real.** Mints charge an input fee per proof on every swap. The gate nets `received − fee`; a token that doesn't cover price + fee is rejected (`insufficient_after_fees`) — clients should use `includeFees` or slightly overpay (change comes back anyway).
+- **Fees are real.** Mints charge an input fee per proof on every swap. The gate nets `received − fee`; a token that doesn't cover price + fee is rejected (`insufficient_after_fees`), and the value the gate did receive comes back in `X-Cashu-Change` as a refund — clients should use `includeFees` or slightly overpay (change comes back anyway).
 - **Trust list = your mints list.** The gate only accepts tokens from mints you configure. A token from any other mint is rejected before redemption.
 - **Earnings are proofs.** What the gate keeps are ordinary Cashu proofs at your mint: melt them to Lightning or hold them like any wallet would. The demo keeps them in memory and reports totals on `/`; a production deployment should persist `onPayment` proofs.
 - Built with [`@cashu/cashu-ts`](https://github.com/cashubtc/cashu-ts) v3. MIT licensed.

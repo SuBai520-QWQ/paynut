@@ -10,13 +10,13 @@
  * real mint you would pay the printed Lightning invoice), mints fresh proofs,
  * then pays and stores the change.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { Wallet, getEncodedToken } from '@cashu/cashu-ts';
 import type { Proof } from '@cashu/cashu-ts';
 import { sumProofs, normalizeMintUrl } from './gate.js';
 import { TEST_MINT } from './server.js';
 
-interface WalletFile {
+export interface WalletFile {
   mint: string;
   unit: string;
   proofs: Proof[];
@@ -25,21 +25,66 @@ interface WalletFile {
 const STORE = process.env.PAYNUT_WALLET ?? 'client-wallet.json';
 const MINT = normalizeMintUrl(process.env.PAYNUT_MINT ?? TEST_MINT);
 const UNIT = 'sat';
+export const DEFAULT_URL = 'http://localhost:8402/paid/fortune';
 
-function loadStore(): WalletFile {
-  if (existsSync(STORE)) {
-    const data = JSON.parse(readFileSync(STORE, 'utf8')) as WalletFile;
-    if (normalizeMintUrl(data.mint) === MINT) return data;
-    console.error(`wallet file is for mint ${data.mint}, not ${MINT}; starting fresh (old file kept)`);
+export interface CliOptions {
+  url: string;
+  topupAmount: number;
+}
+
+/** Parse `[url] [--topup N]`; the value after --topup is not the URL. */
+export function parseArgs(args: string[]): CliOptions {
+  let url: string | undefined;
+  let topupAmount = 32;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '--topup') {
+      topupAmount = Number(args[i + 1]);
+      i += 1;
+      continue;
+    }
+    if (!args[i].startsWith('--') && url === undefined) url = args[i];
   }
-  return { mint: MINT, unit: UNIT, proofs: [] };
+  if (!Number.isInteger(topupAmount) || topupAmount <= 0) {
+    throw new Error('--topup needs a positive integer');
+  }
+  return { url: url ?? DEFAULT_URL, topupAmount };
 }
 
-function saveStore(store: WalletFile) {
-  writeFileSync(STORE, JSON.stringify(store, null, 2), { mode: 0o600 });
+function backupPath(file: string, mint: string): string {
+  return `${file}.${mint.replace(/[^a-zA-Z0-9]+/g, '_')}.bak`;
 }
 
-async function topUp(wallet: Wallet, store: WalletFile, amount: number) {
+/**
+ * Load the wallet file. A file belonging to another mint is moved aside
+ * rather than reused: the next save would otherwise overwrite (and destroy)
+ * proofs that only that other mint can redeem.
+ */
+export function loadStore(file: string, mint: string): WalletFile {
+  if (existsSync(file)) {
+    let data: WalletFile;
+    try {
+      data = JSON.parse(readFileSync(file, 'utf8')) as WalletFile;
+    } catch (err) {
+      throw new Error(
+        `wallet file ${file} is not valid JSON (${err instanceof Error ? err.message : String(err)}); move it aside to start fresh`,
+      );
+    }
+    if (typeof data?.mint !== 'string' || !Array.isArray(data.proofs)) {
+      throw new Error(`wallet file ${file} is not a paynut wallet; move it aside to start fresh`);
+    }
+    if (normalizeMintUrl(data.mint) === normalizeMintUrl(mint)) return data;
+    const backup = backupPath(file, data.mint);
+    renameSync(file, backup);
+    console.error(`wallet file is for mint ${data.mint}, not ${mint}; moved to ${backup}; starting fresh`);
+  }
+  return { mint: normalizeMintUrl(mint), unit: UNIT, proofs: [] };
+}
+
+export function saveStore(file: string, store: WalletFile) {
+  writeFileSync(file, JSON.stringify(store, null, 2), { mode: 0o600 });
+}
+
+async function topUp(wallet: Wallet, store: WalletFile, amount: number, save: (s: WalletFile) => void) {
   const quote = await wallet.createMintQuoteBolt11(amount);
   console.log(`mint quote ${quote.quote}: pay this Lightning invoice to fund the wallet:`);
   console.log(quote.request);
@@ -53,19 +98,124 @@ async function topUp(wallet: Wallet, store: WalletFile, amount: number) {
   }
   const proofs = await wallet.mintProofs(amount, quote.quote);
   store.proofs.push(...proofs);
-  saveStore(store);
+  save(store);
   console.log(`minted ${amount} ${UNIT}; balance now ${sumProofs(store.proofs)}`);
 }
 
+/** The slice of cashu-ts Wallet that paying needs (injectable for tests). */
+export interface PaymentWallet {
+  send(
+    amount: number,
+    proofs: Proof[],
+    config?: { includeFees?: boolean },
+  ): Promise<{ keep: Proof[]; send: Proof[] }>;
+  receive(token: string): Promise<Proof[]>;
+}
+
+export interface CallResult {
+  status: number;
+  body: string;
+  /** Value banked from the X-Cashu-Change header (0 when there was none). */
+  change: number;
+  /** True when the payment token was returned to the wallet after a rejected call. */
+  reclaimed: boolean;
+}
+
+/**
+ * Pay for one call and keep the wallet file consistent on every path.
+ *
+ * The send proofs leave the store before the request; if the request fails,
+ * they are recovered (rejected before redemption) or swapped back at the mint
+ * (unknown outcome), and only printed as a last resort.
+ */
+export async function payForCall(
+  url: string,
+  price: number,
+  wallet: PaymentWallet,
+  store: WalletFile,
+  save: (s: WalletFile) => void,
+  fetchImpl: (url: string, init?: RequestInit) => Promise<Response> = fetch,
+  ensureFunds?: () => Promise<void>,
+): Promise<CallResult> {
+  let sent: { keep: Proof[]; send: Proof[] };
+  try {
+    sent = await wallet.send(price, store.proofs, { includeFees: true });
+  } catch (err) {
+    if (!ensureFunds) throw err;
+    // The balance check only compares face value; the mint's swap fee can push
+    // the real requirement above it. Top up once and retry.
+    await ensureFunds();
+    sent = await wallet.send(price, store.proofs, { includeFees: true });
+  }
+  store.proofs = sent.keep;
+  save(store);
+  const token = getEncodedToken({ mint: store.mint, proofs: sent.send, unit: store.unit });
+
+  let res: Response;
+  try {
+    res = await fetchImpl(url, { headers: { 'X-Cashu': token } });
+  } catch (err) {
+    const back = await wallet.receive(token).catch(() => undefined);
+    if (back) {
+      store.proofs.push(...back);
+      save(store);
+    } else {
+      console.error(`payment did not reach the server and the token could not be reclaimed; keep it for recovery:\n${token}`);
+    }
+    throw err;
+  }
+
+  const changeHeader = res.headers.get('x-cashu-change');
+  let change = 0;
+  if (changeHeader) {
+    try {
+      const changeProofs = await wallet.receive(changeHeader);
+      store.proofs.push(...changeProofs);
+      save(store);
+      change = sumProofs(changeProofs);
+    } catch (err) {
+      console.error(`could not bank the change token; keep it for recovery:\n${changeHeader}`);
+    }
+  }
+
+  const body = await res.text();
+  let reclaimed = false;
+  if (res.status !== 200) {
+    let reason: string | undefined;
+    try {
+      reason = (JSON.parse(body) as { error?: string }).error;
+    } catch {
+      // not a paynut error body
+    }
+    const untouched =
+      res.status === 400 || ['insufficient', 'untrusted_mint', 'wrong_unit', 'malformed_token'].includes(reason ?? '');
+    if (untouched) {
+      // The gate rejected before redeeming, so these proofs were never spent.
+      store.proofs.push(...sent.send);
+      save(store);
+      reclaimed = true;
+    } else if (!change) {
+      // Redemption was attempted: the token is either burned or unknown.
+      const back = await wallet.receive(token).catch(() => undefined);
+      if (back) {
+        store.proofs.push(...back);
+        save(store);
+        reclaimed = true;
+      } else {
+        console.error(`payment token was not returned by the server and could not be reclaimed; keep it for recovery:\n${token}`);
+      }
+    }
+  }
+  return { status: res.status, body, change, reclaimed };
+}
+
 async function main() {
-  const args = process.argv.slice(2);
-  const url = args.find((a) => !a.startsWith('--')) ?? 'http://localhost:8402/paid/fortune';
-  const topupIdx = args.indexOf('--topup');
-  const topupAmount = topupIdx >= 0 ? Number(args[topupIdx + 1]) : 32;
+  const { url, topupAmount } = parseArgs(process.argv.slice(2));
 
   const wallet = new Wallet(MINT, { unit: UNIT });
   await wallet.loadMint();
-  const store = loadStore();
+  const store = loadStore(STORE, MINT);
+  const save = (s: WalletFile) => saveStore(STORE, s);
 
   let res = await fetch(url);
   if (res.status === 200) {
@@ -84,31 +234,22 @@ async function main() {
   }
   if (sumProofs(store.proofs) < price) {
     console.log(`balance ${sumProofs(store.proofs)} < ${price}; topping up ${topupAmount}`);
-    await topUp(wallet, store, topupAmount);
+    await topUp(wallet, store, topupAmount, save);
   }
 
-  // includeFees: the gate's redemption swap costs the mint's input fee, so
-  // the token's face value must be price + that fee for the gate to net `price`.
-  const { send, keep } = await wallet.send(price, store.proofs, { includeFees: true });
-  store.proofs = keep;
-  saveStore(store);
-  const token = getEncodedToken({ mint: MINT, proofs: send, unit: UNIT });
-
-  res = await fetch(url, { headers: { 'X-Cashu': token } });
-  const changeHeader = res.headers.get('x-cashu-change');
-  if (changeHeader) {
-    // Swap the change token into fresh proofs we own (also proves it is real).
-    const changeProofs = await wallet.receive(changeHeader);
-    store.proofs.push(...changeProofs);
-    saveStore(store);
-    console.log(`got change worth ${sumProofs(changeProofs)} ${UNIT}`);
-  }
-  console.log(`status ${res.status}`);
-  console.log(await res.text());
+  const result = await payForCall(url, price, wallet, store, save, fetch, () =>
+    topUp(wallet, store, topupAmount, save),
+  );
+  if (result.change) console.log(`got change worth ${result.change} ${UNIT}`);
+  console.log(`status ${result.status}`);
+  console.log(result.body);
   console.log(`wallet balance after call: ${sumProofs(store.proofs)} ${UNIT}`);
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+const isMain = import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

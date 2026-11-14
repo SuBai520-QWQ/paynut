@@ -9,7 +9,11 @@ import { Wallet, getEncodedToken, getTokenMetadata } from '@cashu/cashu-ts';
 import type { Proof } from '@cashu/cashu-ts';
 
 export interface PaymentInfo {
-  /** Amount the gate kept (== price, unless fees made the received total land exactly). */
+  /**
+   * Amount the gate kept. Usually `price`; it can differ when the mint's swap
+   * fees are paid out of it, or when change could not be split and the gate
+   * had to keep the full received amount.
+   */
   amount: number;
   mint: string;
   unit: string;
@@ -19,7 +23,24 @@ export interface PaymentInfo {
 
 export type VerifyResult =
   | { ok: true; paid: PaymentInfo; changeToken?: string }
-  | { ok: false; reason: 'malformed_token' | 'untrusted_mint' | 'wrong_unit' | 'insufficient' | 'insufficient_after_fees' | 'redeem_failed'; detail?: string; received?: number };
+  | {
+      ok: false;
+      reason:
+        | 'malformed_token'
+        | 'untrusted_mint'
+        | 'wrong_unit'
+        | 'insufficient'
+        | 'insufficient_after_fees'
+        | 'redeem_failed';
+      detail?: string;
+      received?: number;
+      /**
+       * Refund for a token that was redeemed but did not net `price` after the
+       * mint's swap fee (`insufficient_after_fees`). The received proofs are
+       * already burned, so this is the only way to give the value back.
+       */
+      changeToken?: string;
+    };
 
 export interface GateOptions {
   /** Price of one call, in `unit`. */
@@ -49,12 +70,29 @@ function walletFor(mintUrl: string, unit: string): Promise<Wallet> {
       return w;
     })();
     walletPromises.set(key, p);
+    // A transient loadMint failure (mint restarting, network blip) must not
+    // poison this (mint, unit) forever: drop the rejected promise so the next
+    // payment retries instead of failing instantly for the process lifetime.
+    p.catch(() => {
+      if (walletPromises.get(key) === p) walletPromises.delete(key);
+    });
   }
   return p;
 }
 
+/**
+ * Canonical form of a mint URL for trust checks and wallet caching. URL
+ * parsing lowercases the scheme/host, drops default ports and resolves
+ * dot-segments; trailing slashes are stripped. Anything unparseable falls
+ * back to trailing-slash stripping.
+ */
 export function normalizeMintUrl(url: string): string {
-  return url.replace(/\/+$/, '');
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}${u.pathname.replace(/\/+$/, '')}${u.search}`;
+  } catch {
+    return url.replace(/\/+$/, '');
+  }
 }
 
 export function sumProofs(proofs: Pick<Proof, 'amount'>[]): number {
@@ -80,7 +118,16 @@ export class CashuGate {
     this.onPayment = opts.onPayment;
     this.redeemer =
       opts.redeemer ??
-      (async (mintUrl, token) => (await walletFor(mintUrl, this.unit)).receive(token));
+      (async (mintUrl, token) => {
+        const wallet = await walletFor(mintUrl, this.unit);
+        // cashu-ts compares the token's mint string with the wallet's, so a
+        // token that spells the same mint differently (case, default port)
+        // would be rejected after passing the canonical trust check. Decode
+        // with the wallet's keysets and redeem against the canonical URL.
+        const decoded = wallet.decodeToken(token);
+        decoded.mint = mintUrl;
+        return wallet.receive(decoded);
+      });
     this.splitter =
       opts.splitter ??
       (async (mintUrl, amount, proofs) => {
@@ -119,6 +166,12 @@ export class CashuGate {
     } catch {
       return { ok: false, reason: 'malformed_token' };
     }
+    // getTokenMetadata does not validate the decoded shape: a v3 token whose
+    // `mint` is missing or not a string parses fine, and would otherwise
+    // crash on the URL handling below (500 instead of 400).
+    if (typeof meta.mint !== 'string' || meta.mint.length === 0) {
+      return { ok: false, reason: 'malformed_token' };
+    }
     const mint = normalizeMintUrl(meta.mint);
     if (!this.mints.includes(mint)) {
       return { ok: false, reason: 'untrusted_mint', detail: mint };
@@ -127,6 +180,9 @@ export class CashuGate {
       return { ok: false, reason: 'wrong_unit', detail: meta.unit };
     }
     const presented = meta.amount;
+    if (!Number.isFinite(presented) || presented < 0) {
+      return { ok: false, reason: 'malformed_token' };
+    }
     if (presented < this.price) {
       return { ok: false, reason: 'insufficient', received: presented };
     }
@@ -144,17 +200,37 @@ export class CashuGate {
     const receivedTotal = sumProofs(receivedProofs);
     if (receivedTotal < this.price) {
       // The mint's swap/input fees ate into the payment. The presented proofs
-      // are already burned; be honest about it instead of pretending.
-      return { ok: false, reason: 'insufficient_after_fees', received: receivedTotal };
+      // are already burned, so the received value must go back to the payer
+      // instead of being silently kept by the gate.
+      const refund = receivedTotal > 0 ? this.encodeChange(mint, receivedProofs) : undefined;
+      return {
+        ok: false,
+        reason: 'insufficient_after_fees',
+        received: receivedTotal,
+        changeToken: refund,
+      };
     }
 
     const change = receivedTotal - this.price;
     let keptProofs = receivedProofs;
     let changeToken: string | undefined;
     if (change > 0) {
-      const { keep, send } = await this.splitter(mint, change, receivedProofs);
-      keptProofs = keep;
-      changeToken = getEncodedToken({ mint, proofs: send, unit: this.unit });
+      let split: { keep: Proof[]; send: Proof[] } | undefined;
+      try {
+        split = await this.splitter(mint, change, receivedProofs);
+      } catch (err) {
+        // Redemption already happened, so the gate owns receivedProofs. Serving
+        // the call and keeping the full amount is the least-bad outcome: a 500
+        // would charge the payer and return neither the call nor the change.
+        console.error(
+          `paynut: change split failed for ${mint}; keeping the full ${receivedTotal} ${this.unit} received`,
+          err,
+        );
+      }
+      if (split) {
+        keptProofs = split.keep;
+        changeToken = this.encodeChange(mint, split.send);
+      }
     }
 
     const paid: PaymentInfo = {
@@ -163,7 +239,23 @@ export class CashuGate {
       unit: this.unit,
       proofs: keptProofs,
     };
-    this.onPayment?.(paid);
+    try {
+      this.onPayment?.(paid);
+    } catch (err) {
+      // The payment is already settled; a throwing callback must not turn it
+      // into a 500 where the payer loses the call and the change.
+      console.error('paynut: onPayment threw after the payment was settled', err);
+    }
     return { ok: true, paid, changeToken };
+  }
+
+  /** Encode proofs as a token, or undefined if they cannot be encoded. */
+  private encodeChange(mint: string, proofs: Proof[]): string | undefined {
+    try {
+      return getEncodedToken({ mint, proofs, unit: this.unit });
+    } catch (err) {
+      console.error('paynut: could not encode a change token', err);
+      return undefined;
+    }
   }
 }

@@ -61,8 +61,9 @@ difference.
 
 **Errors:** `400 malformed_token`; `402` with `error` one of
 `untrusted_mint` / `wrong_unit` / `insufficient` (token untouched, client may
-top up and retry) / `insufficient_after_fees` / `redeem_failed` (e.g. token
-already spent).
+top up and retry) / `insufficient_after_fees` (the token was redeemed but fees
+left it short; the value the gate received is refunded in `X-Cashu-Change`) /
+`redeem_failed` (e.g. token already spent).
 
 ## 4. What your clients do (cashu-ts)
 

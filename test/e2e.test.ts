@@ -92,3 +92,27 @@ test('overpaying returns change, and the same token cannot be spent twice', asyn
   const replay = await fetch(`${base}/paid/fortune`, { headers: { 'X-Cashu': token } });
   assert.equal(replay.status, 402, 'a spent token must not buy a second call');
 });
+
+test('a token that only covers the price is refunded when the mint fee eats into it', async (t) => {
+  if (!base) return t.skip('test mint unreachable');
+  // No includeFees: the token's face value is exactly the price, so the gate's
+  // redemption swap fee leaves it short. The gate must return what it received.
+  const { send, keep } = await wallet.send(PRICE, proofs);
+  proofs = keep;
+  const fee = wallet.getFeesForProofs(send);
+  if (fee === 0) return t.skip('test mint charges no swap fee');
+  const token = getEncodedToken({ mint: TEST_MINT, proofs: send, unit: 'sat' });
+
+  const res = await fetch(`${base}/paid/fortune`, { headers: { 'X-Cashu': token } });
+  assert.equal(res.status, 402);
+  const body = await res.json();
+  assert.equal(body.error, 'insufficient_after_fees');
+  assert.equal(body.received, sumProofs(send) - fee);
+
+  const refund = res.headers.get('x-cashu-change');
+  assert.ok(refund, 'refund token missing');
+  assert.equal(getTokenMetadata(refund!).amount, sumProofs(send) - fee);
+
+  // The refund is real money: bank it so the test wallet stays consistent.
+  proofs.push(...(await wallet.receive(refund!)));
+});
