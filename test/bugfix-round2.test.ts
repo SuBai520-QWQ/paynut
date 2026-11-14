@@ -308,6 +308,30 @@ test('PN-N2 client: an X-Cashu-Refund token is banked on a failed call', async (
   assert.equal(total(store.proofs), 8, 'keep 3 + refund 5: the payer is whole');
 });
 
+test('PN-N3: an un-encodable fee refund leaves the proofs in the log for recovery', async (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    errors.push(args.map((a) => String(a)).join(' '));
+  });
+  const unencodable = { ...fakeProof(4), C: 123 } as unknown as Proof;
+  const gate = new CashuGate({
+    price: 5,
+    mints: [MINT_A],
+    redeemer: async () => [unencodable], // received 4 < price 5 after fees
+  });
+
+  const res = await gate.verifyPayment(tokenFor([5]));
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.equal(res.reason, 'insufficient_after_fees');
+    assert.equal(res.changeToken, undefined, 'the refund could not be encoded');
+  }
+  assert.ok(
+    errors.some((line) => line.includes('manual recovery') && line.includes('secret-4')),
+    'the received proofs must be logged for manual recovery, not dropped',
+  );
+});
+
 // ---- PN-N3: change encoding failure keeps the value in the gate ----
 
 test('PN-N3: when change encoding fails the gate keeps the full received amount', async (t) => {
