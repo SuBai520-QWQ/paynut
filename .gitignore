@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.log
+# local client wallet state (contains ecash proofs = bearer money, even if test sats)
+client-wallet.json
+.paynut/

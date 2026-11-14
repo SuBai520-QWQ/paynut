@@ -1,0 +1,30 @@
+{
+  "name": "paynut",
+  "version": "0.1.0",
+  "description": "Pay-per-call APIs with Cashu ecash: an HTTP 402-style paywall middleware, demo server and paying client.",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/server.ts",
+    "client": "tsx src/client.ts",
+    "test": "tsx --test test/gate.test.ts",
+    "test:e2e": "tsx --test test/e2e.test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@cashu/cashu-ts": "^3.7.2",
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "type": "module"
+}
