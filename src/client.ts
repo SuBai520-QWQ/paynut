@@ -16,6 +16,7 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -35,6 +36,14 @@ const QUOTE_FILE = `${STORE}.quote.json`;
 const MINT = normalizeMintUrl(process.env.PAYNUT_MINT ?? TEST_MINT);
 const UNIT = 'sat';
 export const DEFAULT_URL = 'http://localhost:8402/paid/fortune';
+
+/**
+ * The gate's error code for a token it refused to parse (src/gate.ts,
+ * `reason: 'malformed_token'`; src/express.ts serves it as HTTP 400). It is
+ * the ONLY rejection that proves the presented proofs were never redeemed —
+ * every other failure leaves their fate unknown (H3).
+ */
+const MALFORMED_TOKEN_ERROR = 'malformed_token';
 
 export interface CliOptions {
   url: string;
@@ -77,81 +86,156 @@ function uniqueBackupPath(file: string, mint: string): string {
   }
 }
 
-/** All parseable backups of `file` that belong to `mint`, richest first. */
-function backupsFor(file: string, mint: string): { path: string; data: WalletFile }[] {
+/**
+ * All parseable backups of `file` that belong to `mint`, NEWEST first (H6).
+ *
+ * Ordering by balance was the bug: the richest backup is usually the oldest
+ * one, and restoring it resurrects proofs that were already spent — the next
+ * payment then fails on spent inputs and the wallet looks bricked. mtime is
+ * the only ordering that tracks "which of these did I write last".
+ */
+function candidateBackups(file: string, mint: string): { path: string; data: WalletFile }[] {
   const dir = dirname(file) || '.';
   const prefix = `${basename(file)}.`;
-  const found: { path: string; data: WalletFile }[] = [];
+  const found: { path: string; data: WalletFile; mtimeMs: number }[] = [];
   let names: string[];
   try {
     names = readdirSync(dir);
   } catch {
-    return found;
+    return [];
   }
   for (const name of names) {
     if (!name.startsWith(prefix) || !name.includes('.bak')) continue;
+    const path = join(dir, name);
     try {
-      const data = JSON.parse(readFileSync(join(dir, name), 'utf8')) as WalletFile;
-      if (
-        typeof data?.mint === 'string' &&
-        Array.isArray(data.proofs) &&
-        normalizeMintUrl(data.mint) === normalizeMintUrl(mint)
-      ) {
-        found.push({ path: join(dir, name), data });
+      const data = JSON.parse(readFileSync(path, 'utf8')) as WalletFile;
+      if (typeof data?.mint !== 'string' || !Array.isArray(data.proofs)) continue;
+      if (normalizeMintUrl(data.mint) !== normalizeMintUrl(mint)) continue;
+      let mtimeMs = 0;
+      try {
+        mtimeMs = statSync(path).mtimeMs;
+      } catch {
+        mtimeMs = 0;
       }
+      found.push({ path, data, mtimeMs });
     } catch {
       // Not a readable wallet backup; leave it alone.
     }
   }
-  return found.sort((a, b) => sumProofs(b.data.proofs) - sumProofs(a.data.proofs));
+  return found
+    .sort((a, b) => {
+      if (b.mtimeMs !== a.mtimeMs) return b.mtimeMs - a.mtimeMs;
+      // Same millisecond: the higher `.bak.N` suffix was written later.
+      return a.path < b.path ? 1 : a.path > b.path ? -1 : 0;
+    })
+    .map(({ path, data }) => ({ path, data }));
+}
+
+function emptyStore(mint: string): WalletFile {
+  return { mint: normalizeMintUrl(mint), unit: UNIT, proofs: [] };
+}
+
+function adoptBackup(file: string, candidate: { path: string; data: WalletFile }): WalletFile {
+  renameSync(candidate.path, file);
+  console.error(`restored the wallet for ${candidate.data.mint} from backup ${candidate.path}`);
+  return candidate.data;
+}
+
+/**
+ * Read and validate the live wallet file. A file belonging to another mint is
+ * moved aside rather than reused: the next save would otherwise overwrite
+ * (and destroy) proofs that only that other mint can redeem. Returns
+ * undefined when there is no usable live file for `mint`.
+ */
+function readLiveStore(file: string, mint: string): WalletFile | undefined {
+  if (!existsSync(file)) return undefined;
+  let data: WalletFile;
+  try {
+    data = JSON.parse(readFileSync(file, 'utf8')) as WalletFile;
+  } catch (err) {
+    throw new Error(
+      `wallet file ${file} is not valid JSON (${err instanceof Error ? err.message : String(err)}); move it aside to start fresh`,
+    );
+  }
+  if (typeof data?.mint !== 'string' || !Array.isArray(data.proofs)) {
+    throw new Error(`wallet file ${file} is not a paynut wallet; move it aside to start fresh`);
+  }
+  // PN-N4: reject files whose unit or proof shapes do not match what this
+  // client writes, instead of failing obscurely on the payment path.
+  if (typeof data.unit === 'string' && data.unit !== UNIT) {
+    throw new Error(
+      `wallet file ${file} is for unit ${data.unit}, not ${UNIT}; move it aside to start fresh`,
+    );
+  }
+  if (
+    data.proofs.some(
+      (p) => !p || typeof p !== 'object' || !Number.isFinite(Number((p as Proof).amount)),
+    )
+  ) {
+    throw new Error(`wallet file ${file} holds malformed proofs; move it aside to start fresh`);
+  }
+  if (normalizeMintUrl(data.mint) === normalizeMintUrl(mint)) return data;
+  const backup = uniqueBackupPath(file, data.mint);
+  renameSync(file, backup);
+  console.error(`wallet file is for mint ${data.mint}, not ${mint}; moved to ${backup}`);
+  return undefined;
 }
 
 /**
  * Load the wallet file. A file belonging to another mint is moved aside
- * rather than reused: the next save would otherwise overwrite (and destroy)
- * proofs that only that other mint can redeem. The move-aside uses a unique
- * backup name, and if a backup for the requested mint is lying around it is
- * restored as the live wallet (PN-N1) instead of starting from zero.
+ * rather than reused; if a backup for the requested mint is lying around the
+ * NEWEST one is restored as the live wallet (PN-N1, H6) instead of starting
+ * from zero.
  */
 export function loadStore(file: string, mint: string): WalletFile {
-  if (existsSync(file)) {
-    let data: WalletFile;
+  const live = readLiveStore(file, mint);
+  if (live) return live;
+  const [restore] = candidateBackups(file, mint);
+  if (restore) return adoptBackup(file, restore);
+  return emptyStore(mint);
+}
+
+/** Does this set of proofs still spend? `true` = unspent. */
+export type UnspentCheck = (proofs: Proof[]) => Promise<boolean>;
+
+/**
+ * Same as loadStore, but asks the mint before adopting a backup (H6): the
+ * newest backup whose proofs still check as unspent wins. A backup the mint
+ * reports as spent is skipped, because restoring it puts dead proofs in the
+ * wallet and the next payment fails on them.
+ *
+ * When the mint cannot answer (offline, no checkstate method) the newest
+ * backup is used as-is: refusing to start is worse than a stale wallet.
+ */
+export async function loadStoreChecked(
+  file: string,
+  mint: string,
+  checkUnspent?: UnspentCheck,
+): Promise<WalletFile> {
+  const live = readLiveStore(file, mint);
+  if (live) return live;
+
+  const candidates = candidateBackups(file, mint);
+  if (candidates.length === 0) return emptyStore(mint);
+  if (!checkUnspent) return adoptBackup(file, candidates[0]);
+
+  for (const candidate of candidates) {
+    let unspent: boolean;
     try {
-      data = JSON.parse(readFileSync(file, 'utf8')) as WalletFile;
+      unspent = await checkUnspent(candidate.data.proofs);
     } catch (err) {
-      throw new Error(
-        `wallet file ${file} is not valid JSON (${err instanceof Error ? err.message : String(err)}); move it aside to start fresh`,
+      console.error(
+        `could not check backup ${candidate.path} against the mint; using it as-is`,
+        err,
       );
+      return adoptBackup(file, candidate);
     }
-    if (typeof data?.mint !== 'string' || !Array.isArray(data.proofs)) {
-      throw new Error(`wallet file ${file} is not a paynut wallet; move it aside to start fresh`);
-    }
-    // PN-N4: reject files whose unit or proof shapes do not match what this
-    // client writes, instead of failing obscurely on the payment path.
-    if (typeof data.unit === 'string' && data.unit !== UNIT) {
-      throw new Error(
-        `wallet file ${file} is for unit ${data.unit}, not ${UNIT}; move it aside to start fresh`,
-      );
-    }
-    if (
-      data.proofs.some(
-        (p) => !p || typeof p !== 'object' || !Number.isFinite(Number((p as Proof).amount)),
-      )
-    ) {
-      throw new Error(`wallet file ${file} holds malformed proofs; move it aside to start fresh`);
-    }
-    if (normalizeMintUrl(data.mint) === normalizeMintUrl(mint)) return data;
-    const backup = uniqueBackupPath(file, data.mint);
-    renameSync(file, backup);
-    console.error(`wallet file is for mint ${data.mint}, not ${mint}; moved to ${backup}`);
+    if (unspent) return adoptBackup(file, candidate);
+    console.error(`backup ${candidate.path} holds only spent proofs; trying the next one`);
   }
-  const [restore] = backupsFor(file, mint);
-  if (restore) {
-    renameSync(restore.path, file);
-    console.error(`restored the wallet for mint ${mint} from backup ${restore.path}`);
-    return restore.data;
-  }
-  return { mint: normalizeMintUrl(mint), unit: UNIT, proofs: [] };
+
+  console.error(`every backup for ${mint} holds spent proofs; starting from an empty wallet`);
+  return emptyStore(mint);
 }
 
 export function saveStore(file: string, store: WalletFile) {
@@ -182,7 +266,8 @@ function readPendingQuote(quoteFile: string, amount: number): PendingQuote | und
  * Fund the wallet by `amount`. The mint quote is persisted BEFORE waiting
  * for payment (round-1 known limit): if the process dies after the invoice
  * was paid but before minting, the next run resumes the same quote instead
- * of paying for a second one. The persisted quote is cleared once minted.
+ * of paying for a second one. The persisted quote is cleared once minted
+ * and only once the minted proofs are durably saved (H5).
  */
 export async function topUp(
   wallet: Wallet,
@@ -202,7 +287,7 @@ export async function topUp(
     console.log(`mint quote ${quote.quote}: pay this Lightning invoice to fund the wallet:`);
     console.log(quote.request);
   }
-  console.log('(test mint uses a FakeWallet — the invoice settles by itself, just wait)');
+  console.log('(test mint uses a FakeWallet: the invoice settles by itself, just wait)');
   const deadline = Date.now() + 120_000;
   for (;;) {
     const status = await wallet.checkMintQuoteBolt11(quote.quote);
@@ -211,9 +296,13 @@ export async function topUp(
     await new Promise((r) => setTimeout(r, 1000));
   }
   const proofs = await wallet.mintProofs(amount, quote.quote);
-  rmSync(quoteFile, { force: true });
+  // H5: the minted proofs are money. Persist them BEFORE the quote record is
+  // deleted: if the save throws (or the process dies here) the quote file
+  // still names the quote, so the next run can investigate instead of
+  // silently losing freshly minted proofs that nothing on disk refers to.
   store.proofs.push(...proofs);
   save(store);
+  rmSync(quoteFile, { force: true });
   console.log(`minted ${amount} ${UNIT}; balance now ${sumProofs(store.proofs)}`);
 }
 
@@ -236,6 +325,12 @@ export interface CallResult {
   refund: number;
   /** True when the payment token was returned to the wallet after a rejected call. */
   reclaimed: boolean;
+  /**
+   * The gate's error code when the call was rejected (`insufficient`,
+   * `malformed_token`, ...), or `http_<status>` when the body carried none.
+   * Undefined on a 200 (H3: the caller needs to see WHY a call failed).
+   */
+  error?: string;
 }
 
 /**
@@ -296,7 +391,7 @@ export async function payForCall(
   }
 
   // PN-N2: a server whose handler failed after settlement refunds the kept
-  // amount in this header. Bank it like change — it is the price coming back.
+  // amount in this header. Bank it like change: it is the price coming back.
   const refundHeader = res.headers.get('x-cashu-refund');
   let refund = 0;
   if (refundHeader) {
@@ -312,6 +407,7 @@ export async function payForCall(
 
   const body = await res.text();
   let reclaimed = false;
+  let error: string | undefined;
   if (res.status !== 200) {
     let reason: string | undefined;
     try {
@@ -319,8 +415,22 @@ export async function payForCall(
     } catch {
       // not a paynut error body
     }
-    const untouched =
-      res.status === 400 || ['insufficient', 'untrusted_mint', 'wrong_unit', 'malformed_token'].includes(reason ?? '');
+    error = reason ?? `http_${res.status}`;
+
+    // H3: only the gate's PRE-REDEEM rejection codes prove the presented
+    // proofs were never burned, so they are the only ones that may be
+    // re-banked. The old test was `status === 400 || <reason list>`, which
+    // re-banked spent proofs on any 400 and bricked the wallet.
+    //
+    // `insufficient_after_fees` is excluded (the gate already refunded it via
+    // X-Cashu-Change) and `redeem_failed` is excluded (unknown outcome).
+    const untouched = [
+      MALFORMED_TOKEN_ERROR,
+      'insufficient',
+      'untrusted_mint',
+      'wrong_unit',
+    ].includes(reason ?? '');
+
     if (untouched) {
       // The gate rejected before redeeming, so these proofs were never spent.
       store.proofs.push(...sent.send);
@@ -330,7 +440,7 @@ export async function payForCall(
       // Redemption was attempted: the token is either burned or its outcome
       // is unknown. ALWAYS try to swap it back (PN-N2: a banked change token
       // must not stand in for the price and skip this), and when the swap
-      // fails, print the token as the recovery record — refunded or not.
+      // fails, print the token as the recovery record: refunded or not.
       const back = await wallet.receive(token).catch(() => undefined);
       if (back) {
         store.proofs.push(...back);
@@ -345,7 +455,25 @@ export async function payForCall(
       }
     }
   }
-  return { status: res.status, body, change, refund, reclaimed };
+  return { status: res.status, body, change, refund, reclaimed, error };
+}
+
+/**
+ * Best-effort adapter for cashu-ts's proof-state check. Returns undefined when
+ * the installed build has no checkProofsStates method, so the caller falls
+ * back to "newest backup wins" without a mint round trip (H6).
+ */
+async function buildUnspentCheck(wallet: Wallet): Promise<UnspentCheck | undefined> {
+  const candidate = wallet as unknown as {
+    checkProofsStates?: (proofs: Proof[]) => Promise<Array<{ state?: string }>>;
+  };
+  if (typeof candidate.checkProofsStates !== 'function') return undefined;
+  const check = candidate.checkProofsStates.bind(candidate);
+  return async (proofs: Proof[]) => {
+    if (proofs.length === 0) return true;
+    const states = await check(proofs);
+    return states.every((s) => String(s.state).toUpperCase() === 'UNSPENT');
+  };
 }
 
 async function main() {
@@ -353,7 +481,8 @@ async function main() {
 
   const wallet = new Wallet(MINT, { unit: UNIT });
   await wallet.loadMint();
-  const store = loadStore(STORE, MINT);
+  const checkUnspent = await buildUnspentCheck(wallet);
+  const store = await loadStoreChecked(STORE, MINT, checkUnspent);
   const save = (s: WalletFile) => saveStore(STORE, s);
 
   let res = await fetch(url);
@@ -381,6 +510,7 @@ async function main() {
   );
   if (result.change) console.log(`got change worth ${result.change} ${UNIT}`);
   if (result.refund) console.log(`got a refund worth ${result.refund} ${UNIT}`);
+  if (result.error) console.log(`gate rejected with: ${result.error}`);
   console.log(`status ${result.status}`);
   console.log(result.body);
   console.log(`wallet balance after call: ${sumProofs(store.proofs)} ${UNIT}`);
